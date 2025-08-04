@@ -1,0 +1,97 @@
+from flask import Flask, request, jsonify
+from models import db, Company, Warehouse, Product, Inventory, Supplier, SupplierProduct, InventoryTransaction
+from datetime import datetime, timedelta
+
+app = Flask(__name__)
+
+@app.route("/api/companies/<int:company_id>/alerts/low-stock", methods=["GET"])
+def low_stock_alerts(company_id):
+    """
+    Returns low-stock alerts for a company across all its warehouses.
+    Business rules applied:
+      - Only include products with recent sales activity
+      - Compare stock levels against product-specific thresholds
+      - Include supplier info for reordering
+    """
+
+    # --- Assumptions ---
+    # 1. Product.low_stock_threshold exists (per-product threshold)
+    # 2. "Recent sales activity" means transactions in last 30 days
+    # 3. SupplierProduct defines the primary supplier (choose the first if multiple)
+    # 4. Each Product belongs to the company (via its warehouses)
+    # 5. days_until_stockout = current_stock / average_daily_sales
+
+    # Edge case: company not found
+    company = Company.query.get(company_id)
+    if not company:
+        return jsonify({"error": "Company not found"}), 404
+
+    alerts = []
+    THIRTY_DAYS_AGO = datetime.utcnow() - timedelta(days=30)
+
+    # Query warehouses for this company
+    warehouses = Warehouse.query.filter_by(company_id=company_id).all()
+    if not warehouses:
+        return jsonify({"alerts": [], "total_alerts": 0})
+
+    for wh in warehouses:
+        # Get inventory per warehouse
+        inventories = Inventory.query.filter_by(warehouse_id=wh.warehouse_id).all()
+
+        for inv in inventories:
+            product = Product.query.get(inv.product_id)
+
+            # Skip if no threshold set
+            if not getattr(product, "low_stock_threshold", None):
+                continue
+
+            # Skip if stock is above threshold
+            if inv.quantity >= product.low_stock_threshold:
+                continue
+
+            # --- Check for recent sales activity ---
+            recent_sales = (
+                InventoryTransaction.query
+                .filter(
+                    InventoryTransaction.product_id == product.product_id,
+                    InventoryTransaction.warehouse_id == wh.warehouse_id,
+                    InventoryTransaction.change_type == "DECREASE",
+                    InventoryTransaction.created_at >= THIRTY_DAYS_AGO
+                ).all()
+            )
+
+            if not recent_sales:
+                continue  # skip products with no recent sales
+
+            # --- Estimate stockout days ---
+            total_sold = sum([abs(tx.quantity_change) for tx in recent_sales])
+            days_active = (datetime.utcnow() - THIRTY_DAYS_AGO).days or 1
+            avg_daily_sales = total_sold / days_active if total_sold > 0 else 1
+            days_until_stockout = int(inv.quantity / avg_daily_sales) if avg_daily_sales > 0 else None
+
+            # --- Get Supplier Info ---
+            supplier_rel = SupplierProduct.query.filter_by(product_id=product.product_id).first()
+            supplier_data = None
+            if supplier_rel:
+                supplier = Supplier.query.get(supplier_rel.supplier_id)
+                if supplier:
+                    supplier_data = {
+                        "id": supplier.supplier_id,
+                        "name": supplier.name,
+                        "contact_email": getattr(supplier, "contact_email", None)
+                    }
+
+            # --- Build Alert Entry ---
+            alerts.append({
+                "product_id": product.product_id,
+                "product_name": product.name,
+                "sku": product.sku,
+                "warehouse_id": wh.warehouse_id,
+                "warehouse_name": wh.name,
+                "current_stock": inv.quantity,
+                "threshold": product.low_stock_threshold,
+                "days_until_stockout": days_until_stockout,
+                "supplier": supplier_data
+            })
+
+    return jsonify({"alerts": alerts, "total_alerts": len(alerts)})
