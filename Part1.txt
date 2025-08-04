@@ -1,0 +1,108 @@
+1. Issues in the Provided Code
+Technical & Business Logic Issues
+SKU uniqueness not enforced
+The code inserts products without checking if a SKU already exists.
+Products tied to only one warehouse.You said a product can exist in multiple warehouses, but here each product is created with a single warehouse_id and inventory entry.
+Price stored without type validation
+If price is sent as a string or invalid decimal, this will break or cause incorrect storage.
+No transaction handling
+Two separate commits are done. If the second commit (for Inventory) fails, the product is created without inventory — inconsistent state.
+Blind access to request JSON
+Using data['key'] directly without validation will raise KeyError if a field is missing.
+Some fields are optional per your context, so .get() should be used.
+Initial quantity assumption
+data['initial_quantity'] is used but not validated. If missing, the code throws an error.
+No error handling / rollback
+If anything goes wrong, the DB is left dirty and the API may crash.
+Business rule violation for multiple warehouses
+Storing warehouse_id inside the Product table couples a product to a warehouse, which conflicts with the requirement.
+
+
+
+2. Impact in Production
+Duplicate SKUs
+Leads to ambiguity in identifying products. Downstream systems (inventory lookup, orders) may break.
+Incorrect warehouse model
+A product is stuck with one warehouse, making multi-warehouse management impossible.
+Invalid prices
+May result in wrong billing, angry customers, and accounting issues.
+Partial commits
+If Product inserts but Inventory fails, you get products with no inventory — confusing for staff.
+API crashes on missing fields
+Causes poor user experience and 500 errors.
+Quantity errors
+Missing or negative initial_quantity corrupts inventory counts.
+Silent data corruption
+Without proper error handling and validation, bugs may go unnoticed until too late.
+
+
+
+Fixing it Like.
+from flask import request, jsonify
+from sqlalchemy.exc import IntegrityError
+from decimal import Decimal, InvalidOperation
+from app import db
+from models import Product, Inventory
+
+@app.route('/api/products', methods=['POST'])
+def create_product():
+    data = request.get_json() or {}
+
+    # Validate required fields
+    required_fields = ['name', 'sku', 'price', 'initial_quantity', 'warehouse_ids']
+    missing = [f for f in required_fields if f not in data]
+    if missing:
+        return jsonify({"error": f"Missing required fields: {', '.join(missing)}"}), 400
+
+    # Validate SKU uniqueness
+    if Product.query.filter_by(sku=data['sku']).first():
+        return jsonify({"error": "SKU already exists"}), 400
+
+    # Validate price
+    try:
+        price = Decimal(str(data['price']))
+        if price < 0:
+            return jsonify({"error": "Price cannot be negative"}), 400
+    except (InvalidOperation, ValueError):
+        return jsonify({"error": "Invalid price format"}), 400
+
+    # Validate initial quantity
+    try:
+        initial_qty = int(data['initial_quantity'])
+        if initial_qty < 0:
+            return jsonify({"error": "Quantity cannot be negative"}), 400
+    except ValueError:
+        return jsonify({"error": "Invalid initial quantity"}), 400
+
+    try:
+        # Create product
+        product = Product(
+            name=data['name'],
+            sku=data['sku'],
+            price=price
+        )
+        db.session.add(product)
+        db.session.flush()  # get product.id without committing yet
+
+        # Create inventory for each warehouse
+        for wid in data['warehouse_ids']:
+            inventory = Inventory(
+                product_id=product.id,
+                warehouse_id=wid,
+                quantity=initial_qty
+            )
+            db.session.add(inventory)
+
+        db.session.commit()
+
+        return jsonify({
+            "message": "Product created successfully",
+            "product_id": product.id
+        }), 201
+
+    except IntegrityError:
+        db.session.rollback()
+        return jsonify({"error": "Database integrity error"}), 500
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
