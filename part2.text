@@ -1,0 +1,146 @@
+1. Gaps / Questions for the Product Team
+To finalize the schema, I’d ask:
+
+Products
+Do SKUs need to be unique across all companies or unique per company?
+
+Can a product belong to multiple companies, or are they company-specific?
+
+Inventory
+Should we track minimum stock levels for alerts?
+
+Do we need to support reserved stock (e.g., for pending orders)?
+
+Should quantities allow negative values (backorders)?
+
+Bundles
+Can bundles contain other bundles, or only base products?
+
+Do bundles have their own SKU and price, or is the price computed from components?
+
+Suppliers
+Can a supplier provide products to multiple companies?
+
+Do we need to track lead times, cost prices, or contracts per supplier-product relationship?
+
+Transactions
+Should we track who made the change (user ID, system, API)?
+
+Do we need reason codes (e.g., purchase, damage, theft, adjustment)?
+
+Should transaction history be immutable (auditing)?
+
+General
+Do we need soft deletes (marking inactive instead of deleting)?
+
+How often will reports be run — do we need materialized views for performance?
+
+2. Design Decisions & Justification
+Keys and Constraints
+Primary keys: Auto-increment IDs for simplicity; natural keys (like SKU) still enforced as unique.
+
+Foreign keys: Ensure referential integrity between companies, warehouses, products, etc.
+
+Composite uniqueness: UNIQUE(product_id, warehouse_id) in Inventory prevents duplicate inventory records for the same warehouse-product pair.
+
+Indexes
+Product.sku indexed for fast lookups.
+
+Indexes on InventoryTransaction(product_id, warehouse_id) for reporting and auditing.
+
+SupplierProduct composite PK doubles as an index for many-to-many lookups.
+
+Data Types
+DECIMAL for price (not FLOAT) to prevent rounding errors.
+
+INT for quantities — can be changed to BIGINT if high-volume.
+
+ENUM for change_type in transactions for clarity and data consistency.
+
+Auditability
+InventoryTransaction table provides a full history of stock changes — better than just updating quantities.
+
+Flexibility
+ProductBundle allows recursive bundles, supporting complex products.
+
+Separate SupplierProduct relation to allow multiple suppliers for the same product.
+-- COMPANIES
+CREATE TABLE Company (
+    company_id      BIGINT PRIMARY KEY AUTO_INCREMENT,
+    name            VARCHAR(255) NOT NULL,
+    industry        VARCHAR(100),
+    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- WAREHOUSES
+CREATE TABLE Warehouse (
+    warehouse_id    BIGINT PRIMARY KEY AUTO_INCREMENT,
+    company_id      BIGINT NOT NULL,
+    name            VARCHAR(255) NOT NULL,
+    location        VARCHAR(255),
+    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (company_id) REFERENCES Company(company_id)
+);
+
+-- PRODUCTS
+CREATE TABLE Product (
+    product_id      BIGINT PRIMARY KEY AUTO_INCREMENT,
+    sku             VARCHAR(100) UNIQUE NOT NULL,
+    name            VARCHAR(255) NOT NULL,
+    description     TEXT,
+    price           DECIMAL(10,2) NOT NULL,
+    is_bundle       BOOLEAN DEFAULT FALSE,
+    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- INVENTORY (current snapshot of stock per warehouse)
+CREATE TABLE Inventory (
+    inventory_id    BIGINT PRIMARY KEY AUTO_INCREMENT,
+    product_id      BIGINT NOT NULL,
+    warehouse_id    BIGINT NOT NULL,
+    quantity        INT NOT NULL DEFAULT 0,
+    updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    UNIQUE (product_id, warehouse_id),
+    FOREIGN KEY (product_id) REFERENCES Product(product_id),
+    FOREIGN KEY (warehouse_id) REFERENCES Warehouse(warehouse_id)
+);
+
+-- INVENTORY TRANSACTIONS (to track history of changes)
+CREATE TABLE InventoryTransaction (
+    transaction_id  BIGINT PRIMARY KEY AUTO_INCREMENT,
+    product_id      BIGINT NOT NULL,
+    warehouse_id    BIGINT NOT NULL,
+    change_type     ENUM('INCREASE', 'DECREASE', 'ADJUSTMENT') NOT NULL,
+    quantity_change INT NOT NULL,
+    reason          VARCHAR(255),
+    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (product_id) REFERENCES Product(product_id),
+    FOREIGN KEY (warehouse_id) REFERENCES Warehouse(warehouse_id)
+);
+
+-- SUPPLIERS
+CREATE TABLE Supplier (
+    supplier_id     BIGINT PRIMARY KEY AUTO_INCREMENT,
+    name            VARCHAR(255) NOT NULL,
+    contact_info    VARCHAR(255),
+    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- SUPPLIER-PRODUCT RELATION (many-to-many)
+CREATE TABLE SupplierProduct (
+    supplier_id     BIGINT NOT NULL,
+    product_id      BIGINT NOT NULL,
+    PRIMARY KEY (supplier_id, product_id),
+    FOREIGN KEY (supplier_id) REFERENCES Supplier(supplier_id),
+    FOREIGN KEY (product_id) REFERENCES Product(product_id)
+);
+
+-- PRODUCT BUNDLES (a bundle containing multiple products)
+CREATE TABLE ProductBundle (
+    bundle_id       BIGINT NOT NULL,
+    component_id    BIGINT NOT NULL,
+    quantity        INT NOT NULL DEFAULT 1,
+    PRIMARY KEY (bundle_id, component_id),
+    FOREIGN KEY (bundle_id) REFERENCES Product(product_id),
+    FOREIGN KEY (component_id) REFERENCES Product(product_id)
+);
